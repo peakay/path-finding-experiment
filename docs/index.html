@@ -16,7 +16,7 @@
         height: 100%;
       }
     </style>
-  <link rel="modulepreload" href="/pk-chat-agent-afe9a6e5d5e36ffe.js" crossorigin="anonymous" integrity="sha384-AslqKpDJ5eBqKRIA+9ghk5dFSP952x4gUe4y7AKBfFR+ce+l6KhxTcQywqD0yF5R"><link rel="preload" href="/pk-chat-agent-afe9a6e5d5e36ffe_bg.wasm" crossorigin="anonymous" integrity="sha384-xjl1UPCHak5mww5arlowpZyomSw//Rcm+A/c7hvZyDejjLn4nETc3l+JDJoYDCsE" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="./pk-chat-agent-afe9a6e5d5e36ffe.js" crossorigin="anonymous" integrity="sha384-ebj2AWpPlPOndFGD4j5KEFCMbJ1X7YZyep2SMdmXVyvPR2vM7S3IVl/zdjo2Scmv"><link rel="preload" href="./pk-chat-agent-afe9a6e5d5e36ffe_bg.wasm" crossorigin="anonymous" integrity="sha384-9kJd1BxfgszbolrtXhRI0vBALj+vas0glg5qgqPAdUKe30dj3OaKuhr80FrEs7NU" as="fetch" type="application/wasm"></head>
   <body>
     <canvas id="the_canvas_id"></canvas>
     <script type="module">
@@ -25,8 +25,8 @@
     </script>
   
 <script type="module">
-import init, * as bindings from '/pk-chat-agent-afe9a6e5d5e36ffe.js';
-const wasm = await init({ module_or_path: '/pk-chat-agent-afe9a6e5d5e36ffe_bg.wasm' });
+import init, * as bindings from './pk-chat-agent-afe9a6e5d5e36ffe.js';
+const wasm = await init({ module_or_path: './pk-chat-agent-afe9a6e5d5e36ffe_bg.wasm' });
 
 
 window.wasmBindings = bindings;
