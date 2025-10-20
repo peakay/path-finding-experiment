@@ -1,11 +1,14 @@
 use crate::agent::{Agent, LogEntry};
-use crate::events::{EventQueue, PendingToolExecution};
+use crate::animation::AnimationController;
+use crate::board::{BoardInput, BoardRenderer};
+use crate::editor::{EditorState, EditorUI};
+use crate::events::EventQueue;
 use crate::map::{GridMap, TileKind};
 use crate::map_type::MapType;
 use crate::rendering::*;
+use crate::tool_execution::ToolExecutionManager;
+use crate::ui::{AgentPanel, TileInfoPanel};
 use eframe::egui;
-use egui::{Painter, Rect};
-use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use web_time::{Duration, Instant};
 
@@ -28,17 +31,14 @@ pub struct MyApp {
     agent_instruction: String,
     selected_model: String,
 
-    // Tool callback queue
-    tool_callbacks: Arc<Mutex<Vec<(u32, String, Value)>>>,
-
     // Log callback queue from async operations
     log_callbacks: Arc<Mutex<Vec<(u32, LogEntry)>>>,
 
     // Event queue for tick-based processing
     event_queue: EventQueue,
 
-    // Track pending tool executions waiting for events to complete
-    pending_tool_executions: Vec<PendingToolExecution>,
+    // Tool execution manager
+    tool_execution_manager: ToolExecutionManager,
 
     // Agent execution control
     agent_running: bool, // True if agent is in continuous execution loop
@@ -55,13 +55,35 @@ pub struct MyApp {
     // OpenRouter API key
     openrouter_api_key: String,
 
-    // Animation state for status indicators
-    animation_frame: u64,
-    last_animation_update: Instant,
+    // Animation controller
+    animation_controller: AnimationController,
+
+    // Map editor state
+    editor_state: EditorState,
 }
 
 impl MyApp {
+    /// Load OpenRouter API key from localStorage
+    fn load_api_key_from_storage() -> Option<String> {
+        web_sys::window()
+            .and_then(|window| window.local_storage().ok())
+            .flatten()
+            .and_then(|storage| storage.get_item("openrouter_api_key").ok())
+            .flatten()
+    }
+
+    /// Save OpenRouter API key to localStorage
+    fn save_api_key_to_storage(api_key: &str) {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let _ = storage.set_item("openrouter_api_key", api_key);
+            }
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, openrouter_api_key: String) -> Self {
+        // Load API key from localStorage if available, otherwise use provided key
+        let api_key = Self::load_api_key_from_storage().unwrap_or(openrouter_api_key);
         // Prepare sprites
         let tree_image = generate_tree_sprite(48);
         let tree_tex = Some(cc.egui_ctx.load_texture(
@@ -70,31 +92,38 @@ impl MyApp {
             egui::TextureOptions::LINEAR,
         ));
 
+        let initial_map = MapType::LakeTrees.create_map(24, 24).unwrap_or_else(|e| {
+            eprintln!("Failed to load initial map: {}", e);
+            GridMap::new(24, 24, TileKind::Grass)
+        });
+
+        let mut editor_state = EditorState::new(24, 24);
+        editor_state.initialize_from_map(&initial_map);
+
         Self {
             board_dim: 24,
             selected_cell: None,
             selected_tile: None,
-            map: GridMap::default_grass_trees_water(24, 24),
+            map: initial_map,
             current_map_type: MapType::LakeTrees,
             pending_map_change: None,
             tree_tex,
             agent: Agent::new(1, "Agent-1", 6, 10),
             agent_selected: false,
             agent_instruction: String::new(),
-            selected_model: "anthropic/claude-haiku-4.5".to_string(),
-            tool_callbacks: Arc::new(Mutex::new(Vec::new())),
+            selected_model: "x-ai/grok-4-fast".to_string(),
             log_callbacks: Arc::new(Mutex::new(Vec::new())),
             event_queue: EventQueue::new(),
-            pending_tool_executions: Vec::new(),
+            tool_execution_manager: ToolExecutionManager::new(TICK_RATE),
             agent_running: false,
             should_continue_execution: false,
             llm_active: false,
             llm_status_callback: Arc::new(Mutex::new(false)),
             last_tick: Instant::now(),
             accumulated_time: Duration::from_secs(0),
-            openrouter_api_key,
-            animation_frame: 0,
-            last_animation_update: Instant::now(),
+            openrouter_api_key: api_key,
+            animation_controller: AnimationController::new(),
+            editor_state,
         }
     }
 
@@ -167,154 +196,40 @@ impl MyApp {
         // Process pending map change (deferred to avoid blocking UI)
         if let Some(new_map_type) = self.pending_map_change.take() {
             self.current_map_type = new_map_type;
-            self.map = new_map_type.create_map(self.board_dim, self.board_dim);
-            // Clear agent trail when changing maps
-            self.agent.log(LogEntry::Info(
-                "Map changed - agent trail cleared".to_string(),
-            ));
-        }
-    }
-
-    fn render_board(&self, painter: &Painter, rect: Rect) {
-        let n = self.board_dim as f32;
-        let cell = rect.width() / n;
-
-        // Background
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(240, 240, 240));
-
-        // Grid lines
-        let line_color = egui::Color32::from_gray(180);
-        let stroke = egui::Stroke {
-            width: 1.0,
-            color: line_color,
-        };
-        for i in 0..=self.board_dim {
-            let x = rect.left() + (i as f32) * cell;
-            let y = rect.top() + (i as f32) * cell;
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                stroke,
-            );
-        }
-
-        // Paint tiles
-        for y in 0..self.map.height() {
-            for x in 0..self.map.width() {
-                let x0 = rect.left() + (x as f32) * cell;
-                let y0 = rect.top() + (y as f32) * cell;
-                let rcell = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(cell, cell));
-                if let Some(kind) = self.map.get(x, y) {
-                    match kind {
-                        TileKind::Empty => {}
-                        TileKind::Grass => draw_grass_tile(&painter, rcell),
-                        TileKind::Water => draw_water_tile(&painter, rcell),
-                        TileKind::Sand => draw_sand_tile(&painter, rcell),
-                        TileKind::Wall => draw_wall_tile(&painter, rcell),
-                        TileKind::Trail => {
-                            painter.rect_filled(
-                                rcell.shrink(4.0),
-                                2.0,
-                                egui::Color32::from_rgba_premultiplied(255, 200, 0, 100),
-                            );
-                        }
-                        TileKind::Tree => {
-                            if let Some(tex) = &self.tree_tex {
-                                draw_tree_sprite(&painter, rcell, tex);
-                            } else {
-                                draw_grass_tile(&painter, rcell);
-                            }
-                        }
-                        TileKind::Custom(code) => {
-                            let r = ((code >> 16) & 0xFF) as u8;
-                            let g = ((code >> 8) & 0xFF) as u8;
-                            let b = (code & 0xFF) as u8;
-                            painter.rect_filled(
-                                rcell.shrink(2.0),
-                                0.0,
-                                egui::Color32::from_rgb(r, g, b),
-                            );
-                        }
-                    }
+            match new_map_type.create_map(self.board_dim, self.board_dim) {
+                Ok(new_map) => {
+                    self.map = new_map;
+                    // Update board dimensions to match the loaded map
+                    self.board_dim = self.map.width().max(self.map.height());
+                    // Initialize editor state with new map metadata
+                    self.editor_state.initialize_from_map(&self.map);
+                    // Update editor state's target dimensions to match new map
+                    self.editor_state.set_target_dimensions(self.map.width(), self.map.height());
+                    // Clear selection when changing maps to prevent hover issues
+                    self.selected_cell = None;
+                    self.selected_tile = None;
+                    // Clear agent trail when changing maps
+                    self.agent.clear_movement_history();
+                    self.agent.log(LogEntry::Info(
+                        "Map changed - agent trail cleared".to_string(),
+                    ));
                 }
-            }
-        }
-
-        // Selection highlight
-        if let Some((sr, sc)) = self.selected_cell {
-            let x0 = rect.left() + (sc as f32) * cell;
-            let y0 = rect.top() + (sr as f32) * cell;
-            let rcell = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(cell, cell));
-            painter.rect_stroke(
-                rcell.shrink(1.0),
-                0.0,
-                egui::Stroke {
-                    width: 2.0,
-                    color: egui::Color32::YELLOW,
-                },
-            );
-        }
-
-        // Draw agent
-        if self.agent.x < self.map.width() && self.agent.y < self.map.height() {
-            let x0 = rect.left() + (self.agent.x as f32) * cell;
-            let y0 = rect.top() + (self.agent.y as f32) * cell;
-            let center = egui::pos2(x0 + cell * 0.5, y0 + cell * 0.6);
-            painter.circle_filled(center, cell * 0.18, egui::Color32::from_rgb(230, 70, 50));
-            painter.text(
-                egui::pos2(center.x, y0 + cell * 0.15),
-                egui::Align2::CENTER_CENTER,
-                &self.agent.name,
-                egui::FontId::proportional((cell * 0.32).max(10.0)),
-                egui::Color32::BLACK,
-            );
-        }
-    }
-
-    fn handle_board_input(
-        &mut self,
-        ui: &mut egui::Ui,
-        rect: Rect,
-        board_side: f32,
-        response: &egui::Response,
-    ) {
-        let (pressed, down, pointer_pos) = ui.input(|i| {
-            (
-                i.pointer.any_pressed(),
-                i.pointer.any_down(),
-                i.pointer.interact_pos(),
-            )
-        });
-
-        if (pressed || down) && response.hovered() {
-            if let Some(pos) = pointer_pos {
-                let cell = board_side / (self.board_dim as f32);
-                let rel_x = (pos.x - rect.left()).clamp(0.0, board_side - 0.001);
-                let rel_y = (pos.y - rect.top()).clamp(0.0, board_side - 0.001);
-                let c = (rel_x / cell).floor() as usize;
-                let r = (rel_y / cell).floor() as usize;
-
-                if r < self.board_dim && c < self.board_dim {
-                    self.selected_cell = Some((r, c));
-                    self.selected_tile = Some((c, r));
-
-                    // Check if agent was clicked
-                    if r == self.agent.y && c == self.agent.x {
-                        self.agent_selected = true;
-                    } else if pressed {
-                        self.agent_selected = false;
-                    }
+                Err(e) => {
+                    self.agent.log(LogEntry::Error(
+                        format!("Failed to load map: {}", e),
+                    ));
                 }
             }
         }
     }
+
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update animation
+        self.animation_controller.update();
+
         // Process fixed-rate ticks
         self.process_ticks();
 
@@ -329,167 +244,21 @@ impl eframe::App for MyApp {
             }
         }
 
-        // Drain tool callbacks and dispatch to agent (only if execution is still active)
-        let pending: Vec<(u32, String, Value)> = {
-            let mut g = self.tool_callbacks.lock().unwrap();
-            g.drain(..).collect()
-        };
-        for (agent_id, name, args) in pending {
-            if agent_id == self.agent.id {
-                // Skip processing tool callbacks if execution was cancelled
-                if !self.agent_running {
-                    self.agent.log(LogEntry::Info(
-                        format!("TOOL: Discarded '{}' tool call (execution cancelled)", name)
-                    ));
-                    continue;
-                }
-
-                // Generate tool call ID
-                let tool_call_id = format!(
-                    "call_{}",
-                    web_time::SystemTime::now()
-                        .duration_since(web_time::SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                );
-
-                // Add assistant message with tool call to history
-                let args_str = serde_json::to_string(&args).unwrap_or_default();
-                self.agent
-                    .add_assistant_tool_call(tool_call_id.clone(), name.clone(), args_str);
-
-                match self.agent.handle_tool_call(&name, args, &mut self.map) {
-                    Ok(result_msg) => {
-                        // Check if tool generated any pending moves (events to submit)
-                        let moves = self.agent.take_pending_moves();
-
-                        if !moves.is_empty() {
-                            // Tool needs to wait for events to complete
-                            use crate::events::Event;
-
-                            let events: Vec<Event> = moves
-                                .into_iter()
-                                .map(|direction| Event::AgentMove {
-                                    agent_id: self.agent.id,
-                                    direction,
-                                })
-                                .collect();
-
-                            // Submit with 2-tick delay between moves (1 second @ 500ms/tick)
-                            let event_ids = self.event_queue.submit_sequence(events, TICK_RATE * 2);
-
-                            // Create pending tool execution to track this
-                            // If result_msg is empty, it means "don't log initial result"
-                            let initial_result = if result_msg.is_empty() {
-                                String::new()
-                            } else {
-                                result_msg
-                            };
-                            let pending = PendingToolExecution::new(
-                                tool_call_id,
-                                name.clone(),
-                                initial_result,
-                                event_ids,
-                            );
-                            self.pending_tool_executions.push(pending);
-                        } else {
-                            // No events, tool completes immediately
-                            // Only add result if it's not empty (don't log indicator)
-                            if !result_msg.is_empty() {
-                                self.agent
-                                    .add_tool_result(tool_call_id, name.clone(), result_msg);
-                            }
-
-                            // Mark that we should continue execution after tool result
-                            self.should_continue_execution = true;
-                        }
-                    }
-                    Err(e) => {
-                        // Add error as tool result immediately
-                        self.agent.add_tool_result(
-                            tool_call_id,
-                            name.clone(),
-                            format!("Error: {}", e),
-                        );
-                        self.agent
-                            .log(LogEntry::Error(format!("Tool execution failed: {}", e)));
-
-                        // Mark that we should continue execution after tool result
-                        self.should_continue_execution = true;
-                    }
-                }
-            }
+        // Process tool callbacks through the execution manager
+        if self.tool_execution_manager.process_tool_callbacks(
+            &mut self.agent,
+            &mut self.map,
+            &self.event_queue,
+            self.agent_running,
+        ) {
+            self.should_continue_execution = true;
         }
 
         // Complete pending tool executions when their events are done
-        let mut completed_indices = Vec::new();
-        for (idx, pending) in self.pending_tool_executions.iter().enumerate() {
-            if pending.is_complete(&self.event_queue) {
-                completed_indices.push(idx);
-            }
-        }
-
-        // Process completed tool executions in reverse order to maintain indices
-        for idx in completed_indices.into_iter().rev() {
-            let pending = self.pending_tool_executions.remove(idx);
-
-            // Get event results
-            let event_results = pending.get_event_results(&self.event_queue);
-
-            // Check logs for errors/cancellations
-            let recent_logs: Vec<&LogEntry> = self.agent.get_logs().iter().rev().take(20).collect();
-
-            let had_errors = recent_logs.iter().any(|entry| {
-                matches!(entry, LogEntry::Error(msg) if msg.contains("Movement blocked") || msg.contains("ABORT"))
-            });
-
-            let cancelled = recent_logs.iter().any(
-                |entry| matches!(entry, LogEntry::Info(msg) if msg.contains("events cancelled")),
-            );
-
-            // Check if any events failed
-            let event_failures: Vec<String> = event_results
-                .iter()
-                .filter_map(|(_, result)| match result {
-                    Err(e) => Some(e.clone()),
-                    Ok(_) => None,
-                })
-                .collect();
-
-            // Build comprehensive result message
-            let result_msg = if had_errors || cancelled || !event_failures.is_empty() {
-                let mut error_parts = Vec::new();
-
-                if !event_failures.is_empty() {
-                    error_parts.push(format!("Event failures: {}", event_failures.join(", ")));
-                }
-
-                let log_errors: Vec<String> = recent_logs
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        LogEntry::Error(msg) => Some(msg.clone()),
-                        LogEntry::Info(msg) if msg.contains("cancelled") => Some(msg.clone()),
-                        _ => None,
-                    })
-                    .collect();
-
-                if !log_errors.is_empty() {
-                    error_parts.push(format!("Details: {}", log_errors.join("; ")));
-                }
-
-                format!(
-                    "{} (Errors: {})",
-                    pending.initial_result,
-                    error_parts.join(" | ")
-                )
-            } else {
-                format!("{} (Completed successfully)", pending.initial_result)
-            };
-
-            self.agent
-                .add_tool_result(pending.tool_call_id, pending.tool_name, result_msg);
-
-            // Mark that we should continue execution after tool result
+        if self
+            .tool_execution_manager
+            .process_pending_executions(&mut self.agent, &self.event_queue)
+        {
             self.should_continue_execution = true;
         }
 
@@ -505,9 +274,7 @@ impl eframe::App for MyApp {
                 }
 
                 // Clear any pending tool callbacks that haven't been processed yet
-                if let Ok(mut callbacks) = self.tool_callbacks.lock() {
-                    callbacks.clear();
-                }
+                self.tool_execution_manager.clear_callbacks();
 
                 // Clear any pending log callbacks
                 if let Ok(mut logs) = self.log_callbacks.lock() {
@@ -523,14 +290,14 @@ impl eframe::App for MyApp {
         // Continue agent execution if tool result was just added
         if self.should_continue_execution
             && self.agent_running
-            && self.pending_tool_executions.is_empty()
+            && !self.tool_execution_manager.has_pending_executions()
             && self.event_queue.pending_count() == 0
         {
             self.should_continue_execution = false;
 
             // Continue with empty instruction (agent will use chat history)
             let api_key = self.openrouter_api_key.clone();
-            let tool_callbacks = self.tool_callbacks.clone();
+            let tool_callbacks = self.tool_execution_manager.get_tool_callbacks();
             let log_callbacks = self.log_callbacks.clone();
 
             self.agent.execute_instruction(
@@ -546,7 +313,7 @@ impl eframe::App for MyApp {
 
         // Request repaint if there are pending events, tool executions, or LLM activity
         if self.event_queue.pending_count() > 0
-            || !self.pending_tool_executions.is_empty()
+            || self.tool_execution_manager.has_pending_executions()
             || self.agent_running
             || *self.llm_status_callback.lock().unwrap()
         {
@@ -603,7 +370,7 @@ impl MyApp {
 
     fn draw_agent_controls(&mut self, ui: &mut egui::Ui) {
         let is_processing =
-            self.event_queue.pending_count() > 0 || !self.pending_tool_executions.is_empty();
+            AgentPanel::is_processing(&self.event_queue, &self.tool_execution_manager);
         let is_llm_active = *self.llm_status_callback.lock().unwrap();
 
         ui.label("Name");
@@ -697,36 +464,17 @@ impl MyApp {
 
         // Show status indicators under the button
         if is_llm_active {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("AI").size(16.0).strong());
-                ui.label(
-                    egui::RichText::new(&self.get_animated_thinking_text())
-                        .color(egui::Color32::from_rgb(100, 150, 255))
-                        .strong(),
-                );
-            });
-            ui.add_space(4.0);
+            AgentPanel::draw_thinking_status(ui, &self.animation_controller);
         }
 
         if is_processing {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("WORK").size(16.0).strong());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Processing... ({} events)",
-                        self.event_queue.pending_count()
-                    ))
-                    .color(egui::Color32::from_rgb(200, 100, 0))
-                    .strong(),
-                );
-            });
-            ui.add_space(4.0);
+            AgentPanel::draw_processing_status(ui, &self.event_queue, &self.animation_controller);
         }
 
         if should_submit && !is_processing {
             let api_key = self.openrouter_api_key.clone();
             let instruction = self.agent_instruction.clone();
-            let tool_callbacks = self.tool_callbacks.clone();
+            let tool_callbacks = self.tool_execution_manager.get_tool_callbacks();
             let log_callbacks = self.log_callbacks.clone();
 
             // Start agent execution loop
@@ -785,196 +533,66 @@ impl MyApp {
     }
 
     fn draw_tile_info(&mut self, ui: &mut egui::Ui) {
-        if let Some((tile_x, tile_y)) = self.selected_tile {
-            ui.separator();
-            ui.heading("Tile Info");
-
-            egui::Frame::default()
-                .fill(egui::Color32::from_rgb(245, 250, 255))
-                .inner_margin(egui::Margin::same(8.0))
-                .rounding(4.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Position: ({}, {})", tile_x, tile_y))
-                            .strong()
-                            .color(egui::Color32::from_rgb(50, 80, 120)),
-                    );
-
-                    if let Some(tile_kind) = self.map.get(tile_x, tile_y) {
-                        ui.horizontal(|ui| {
-                            ui.label("Type:");
-                            ui.label(
-                                egui::RichText::new(tile_kind.name())
-                                    .color(egui::Color32::from_rgb(80, 120, 80)),
-                            );
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.label("Traversable:");
-                            let (icon, color) = if tile_kind.is_traversable() {
-                                ("YES", egui::Color32::from_rgb(50, 150, 50))
-                            } else {
-                                ("NO", egui::Color32::from_rgb(150, 50, 50))
-                            };
-                            ui.label(egui::RichText::new(icon).color(color).strong());
-                        });
-
-                        // Show if agent is on this tile
-                        if tile_x == self.agent.x && tile_y == self.agent.y {
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("AGENT").size(14.0).strong());
-                                ui.label(
-                                    egui::RichText::new(format!("{} is here", self.agent.name))
-                                        .color(egui::Color32::from_rgb(200, 80, 50))
-                                        .italics(),
-                                );
-                            });
-                        }
-                    }
-                });
-        }
+        TileInfoPanel::draw(ui, self.selected_tile, &self.map, &self.agent);
     }
 
     fn draw_activity_log(&mut self, ui: &mut egui::Ui) {
-        let scroll_area = egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .stick_to_bottom(true);
-
-        scroll_area.show(ui, |ui| {
-            for log_entry in self.agent.get_logs() {
-                draw_log_entry(ui, log_entry);
-            }
-        });
-    }
-
-    /// Generate animated "Thinking..." text with elaborate effects
-    fn get_animated_thinking_text(&mut self) -> String {
-        let now = Instant::now();
-
-        // Update animation frame every 150ms
-        if now.duration_since(self.last_animation_update) >= Duration::from_millis(150) {
-            self.animation_frame = self.animation_frame.wrapping_add(1);
-            self.last_animation_update = now;
-        }
-
-        let frame = self.animation_frame;
-        let cycle = (frame / 20) % 6; // Change animation every 20 frames (3 seconds)
-
-        match cycle {
-            0 => {
-                // Spinning cursor animation
-                let cursors = ["|", "/", "-", "\\"];
-                let cursor_idx = (frame % 4) as usize;
-                format!("Thinking{}  ", cursors[cursor_idx])
-            }
-            1 => {
-                // Wave effect on letters
-                let base = "Thinking...";
-                let chars: Vec<char> = base.chars().collect();
-                let mut result = String::new();
-                for (i, &ch) in chars.iter().enumerate() {
-                    let offset = (frame as i32 + i as i32 * 2) % 8;
-                    if offset < 4 {
-                        result.push(ch.to_ascii_uppercase());
-                    } else {
-                        result.push(ch.to_ascii_lowercase());
-                    }
-                }
-                result
-            }
-            2 => {
-                // Pulsing dots
-                let dots = match frame % 4 {
-                    0 => ".",
-                    1 => "..",
-                    2 => "...",
-                    _ => "",
-                };
-                format!("Thinking{}", dots)
-            }
-            3 => {
-                // Matrix-style random characters
-                let base = "Thinking...";
-                let chars: Vec<char> = base.chars().collect();
-                let mut result = String::new();
-                for &ch in &chars {
-                    if (frame as usize + result.len()) % 3 == 0 {
-                        // Replace with random ASCII char sometimes
-                        let random_char = (b'A' + ((frame as u8 + result.len() as u8) % 26)) as char;
-                        result.push(random_char);
-                    } else {
-                        result.push(ch);
-                    }
-                }
-                result
-            }
-            4 => {
-                // Breathing effect with spaces
-                let spaces = match (frame / 3) % 6 {
-                    0 | 5 => "  ",
-                    1 | 4 => " ",
-                    _ => "",
-                };
-                format!("{}Thinking...{}", spaces, spaces)
-            }
-            _ => {
-                // Rainbow wave effect
-                let base = "Thinking...";
-                let chars: Vec<char> = base.chars().collect();
-                let mut result = String::new();
-                for (i, &ch) in chars.iter().enumerate() {
-                    let wave = ((frame as f32 * 0.3 + i as f32 * 0.5).sin() + 1.0) * 0.5;
-                    if wave > 0.7 {
-                        result.push(ch.to_ascii_uppercase());
-                    } else if wave > 0.3 {
-                        result.push(ch);
-                    } else {
-                        result.push(' ');
-                    }
-                }
-                result
-            }
-        }
+        AgentPanel::draw_activity_log(ui, &self.agent);
     }
 
     fn draw_grid_panel(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            // Map selector
+        egui::Frame::default()
+            .fill(egui::Color32::WHITE)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+            // Top controls: API key, map selector, and edit mode toggle
             ui.horizontal(|ui| {
+                ui.label("API Key:");
+                let mut api_key_changed = false;
+                if ui.text_edit_singleline(&mut self.openrouter_api_key).changed() {
+                    api_key_changed = true;
+                }
+                if api_key_changed {
+                    Self::save_api_key_to_storage(&self.openrouter_api_key);
+                }
+
+                ui.separator();
                 ui.label("Map:");
                 let mut selected_map = self.current_map_type;
                 egui::ComboBox::from_id_source("map_selector")
                     .selected_text(selected_map.name())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut selected_map,
-                            MapType::EmptyGrass,
-                            MapType::EmptyGrass.name(),
-                        );
-                        ui.selectable_value(
-                            &mut selected_map,
-                            MapType::MazeWalls,
-                            MapType::MazeWalls.name(),
-                        );
-                        ui.selectable_value(
-                            &mut selected_map,
-                            MapType::DesertOasis,
-                            MapType::DesertOasis.name(),
-                        );
-                        ui.selectable_value(
-                            &mut selected_map,
-                            MapType::LakeTrees,
-                            MapType::LakeTrees.name(),
-                        );
+                        for map_type in MapType::all() {
+                            ui.selectable_value(&mut selected_map, map_type, map_type.name());
+                        }
                     });
 
                 if selected_map != self.current_map_type {
                     // Defer expensive map creation to avoid blocking UI
                     self.pending_map_change = Some(selected_map);
                 }
+
+                ui.separator();
+                EditorUI::draw_edit_mode_toggle(ui, &mut self.editor_state);
             });
-            ui.add_space(8.0);
+
+            // Tile palette when in edit mode
+            if self.editor_state.edit_mode {
+                if let Some(new_board_dim) = EditorUI::draw_edit_controls(
+                    ui,
+                    &mut self.editor_state,
+                    &mut self.map,
+                    &mut self.agent,
+                ) {
+                    self.board_dim = new_board_dim;
+                    // Clear selection when map is resized to prevent hover issues
+                    self.selected_cell = None;
+                    self.selected_tile = None;
+                }
+            } else {
+                ui.add_space(8.0);
+            }
 
             ui.heading("Game Board");
             let avail_r = ui.available_size();
@@ -983,8 +601,31 @@ impl MyApp {
                 ui.allocate_exact_size(egui::vec2(board_side, board_side), egui::Sense::click());
             let painter = ui.painter();
 
-            self.render_board(&painter, rect);
-            self.handle_board_input(ui, rect, board_side, &response);
-        });
+            // Render the board
+            BoardRenderer::render(
+                &painter,
+                rect,
+                &self.map,
+                &self.agent,
+                self.selected_cell,
+                self.tree_tex.as_ref(),
+            );
+
+            // Handle input
+            BoardInput::handle_input(
+                ui,
+                rect,
+                board_side,
+                self.board_dim,
+                &response,
+                &mut self.editor_state,
+                &mut self.map,
+                &mut self.agent,
+                &mut self.agent_selected,
+                &mut self.selected_cell,
+                &mut self.selected_tile,
+            );
+                });
+            });
     }
 }

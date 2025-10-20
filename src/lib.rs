@@ -1,19 +1,22 @@
 // Module declarations
 mod agent;
+mod animation;
 mod app;
+mod board;
+mod editor;
 mod events;
 mod map;
 mod map_type;
 mod openrouter;
 mod rendering;
+mod tool_execution;
+mod ui;
 
 // Re-export the main app (used by WASM entry point)
 #[cfg(target_arch = "wasm32")]
 use app::MyApp;
 
-// OpenRouter API key
-const OPENROUTER_API_KEY: &str =
-    "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";
+
 
 // WASM entry point
 #[cfg(target_arch = "wasm32")]
@@ -29,7 +32,7 @@ pub fn main() {
             .start(
                 "the_canvas_id",
                 web_options,
-                Box::new(|cc| Ok(Box::new(MyApp::new(cc, OPENROUTER_API_KEY.to_string())))),
+                Box::new(|cc| Ok(Box::new(MyApp::new(cc, String::new())))),
             )
             .await
             .expect("failed to start eframe");

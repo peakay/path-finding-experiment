@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html style="height: 100%; margin: 0; padding: 0;">
+  <head>
+    <meta charset="utf-8" />
+    <title>pk-chat-agent</title>
+    <style>
+      body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  <link rel="modulepreload" href="/pk-chat-agent-afe9a6e5d5e36ffe.js" crossorigin="anonymous" integrity="sha384-AslqKpDJ5eBqKRIA+9ghk5dFSP952x4gUe4y7AKBfFR+ce+l6KhxTcQywqD0yF5R"><link rel="preload" href="/pk-chat-agent-afe9a6e5d5e36ffe_bg.wasm" crossorigin="anonymous" integrity="sha384-xjl1UPCHak5mww5arlowpZyomSw//Rcm+A/c7hvZyDejjLn4nETc3l+JDJoYDCsE" as="fetch" type="application/wasm"></head>
+  <body>
+    <canvas id="the_canvas_id"></canvas>
+    <script type="module">
+      import init from './pkg/pk_chat_agent.js';
+      init();
+    </script>
+  
+<script type="module">
+import init, * as bindings from '/pk-chat-agent-afe9a6e5d5e36ffe.js';
+const wasm = await init({ module_or_path: '/pk-chat-agent-afe9a6e5d5e36ffe_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script></body>
+</html>

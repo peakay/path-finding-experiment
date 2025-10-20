@@ -110,6 +110,9 @@ pub struct Agent {
     movement_step_index: usize, // Current step number (0-based) in the movement sequence
     total_movement_steps: usize, // Total steps in current movement sequence
 
+    // Movement history - tracks all positions visited by this agent
+    movement_history: Vec<(usize, usize)>,
+
     // Configuration
     max_history_messages: usize, // Maximum number of chat history messages to send to LLM
     enabled_tools: HashSet<String>, // Set of enabled tool names
@@ -133,6 +136,7 @@ impl Agent {
             current_target: None,
             movement_step_index: 0,
             total_movement_steps: 0,
+            movement_history: Vec::new(),
             max_history_messages: 50, // Default to last 50 messages
             enabled_tools: HashSet::new(),
             tool_registry: Vec::new(),
@@ -140,6 +144,10 @@ impl Agent {
 
         // Register default tools
         agent.register_default_tools();
+
+        // Initialize movement history with starting position
+        agent.movement_history.push((x, y));
+
         agent
     }
 
@@ -833,8 +841,8 @@ impl Agent {
             return Err(err);
         }
 
-        // Leave trail
-        let _ = map.set(self.x, self.y, TileKind::Trail);
+        // Record current position in movement history
+        self.movement_history.push((self.x, self.y));
 
         // Move agent
         self.set_pos(nx as usize, ny as usize);
@@ -1058,6 +1066,23 @@ impl Agent {
         self.max_history_messages = max.max(1); // Minimum of 1
     }
 
+    /// Get the agent's movement history (all positions visited)
+    pub fn get_movement_history(&self) -> &[(usize, usize)] {
+        &self.movement_history
+    }
+
+    /// Clear the agent's movement history
+    pub fn clear_movement_history(&mut self) {
+        self.movement_history.clear();
+        // Re-add current position as starting point
+        self.movement_history.push((self.x, self.y));
+    }
+
+    /// Check if a position is in the agent's movement history (for trail rendering)
+    pub fn has_visited(&self, x: usize, y: usize) -> bool {
+        self.movement_history.contains(&(x, y))
+    }
+
     /// Generate navigation hint based on current position and target
     pub fn generate_navigation_hint(&self, map: &GridMap, had_errors: bool) -> Option<String> {
         if !had_errors {
@@ -1184,8 +1209,8 @@ impl Agent {
                 return MovementStatus::BlockedByTerrain;
             }
 
-            // Leave trail
-            let _ = map.set(self.x, self.y, TileKind::Trail);
+            // Record current position in movement history
+            self.movement_history.push((self.x, self.y));
 
             // Move agent
             self.set_pos(nx as usize, ny as usize);
